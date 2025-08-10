@@ -1,0 +1,1 @@
+BYBIT_WEBHOOK_SECRET = 'changeme'

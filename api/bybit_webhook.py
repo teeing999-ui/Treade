@@ -1,11 +1,10 @@
-
+"""FastAPI route handling Bybit webhooks with signature verification and event publishing."""
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
@@ -14,66 +13,86 @@ router = APIRouter()
 
 
 class BybitWebhookEvent(BaseModel):
-    """Model representing a Bybit webhook event."""
+    """Serializable event for downstream processing."""
     timestamp: str
     payload: Dict[str, Any]
 
 
 async def _publish_event(event: BybitWebhookEvent) -> None:
-    """Publish event to message broker via existing transport.
-
-    If a transport is unavailable, log the event instead.
-    """
+    """Publish event to message broker (fallback to logging if transport missing)."""
     try:
         from transport import publish  # type: ignore
-    except Exception:  # pragma: no cover - fallback for missing transport
+    except Exception:  # pragma: no cover
         async def publish(e: BybitWebhookEvent) -> None:  # type: ignore
             logging.info("Event published (fallback log): %s", e.json())
 
     await publish(event)
 
 
-@router.post("/bybit/webhook")
-async def bybit_webhook(
-    request: Request,
-    x_bybit_signature: str = Header(..., alias="X-BYBIT-SIGNATURE"),
-    x_bybit_timestamp: str = Header(..., alias="X-BYBIT-TIMESTAMP"),
-) -> Dict[str, str]:
-    """Handle Bybit webhook calls.
+async def _verify(body: bytes, timestamp: str, signature: str) -> bool:
+    """Verify request signature using available project service.
 
-    Steps:
-      1) Read raw body.
-      2) Validate signature via BybitSignatureService (uses BybitSettings).
-         - If the service expects a `timestamp` argument, pass it; otherwise call with (body, signature).
-      3) Parse JSON payload.
-      4) Publish event to message broker.
+    Supports either:
+      - function: services.bybit_signature.verify_signature(body, timestamp, signature)
+                  (or legacy 2-arg form: (body, signature))
+      - class:    services.bybit_signature.BybitSignatureService(BybitSettings).verify(...)
     """
+    # 1) Try functional API first
+    try:
+        from services.bybit_signature import verify_signature  # type: ignore
+        try:
+            ok = verify_signature(body, timestamp, signature)  # type: ignore[misc]
+        except TypeError:
+            ok = verify_signature(body, signature)  # type: ignore[misc]
+        return bool(ok)
+    except Exception:
+        pass
 
-    # 1) Read raw body
-    body: bytes = await request.body()
-
-    # 2) Validate signature via project service
+    # 2) Fallback to OO service
     try:
         from config.bybit import BybitSettings  # type: ignore
         from services.bybit_signature import BybitSignatureService  # type: ignore
-    except Exception as exc:  # pragma: no cover - depends on project wiring
-        logging.exception("Signature service unavailable: %s", exc)
+        svc = BybitSignatureService(BybitSettings())
+        try:
+            ok = svc.verify(body, signature, timestamp)  # type: ignore[misc]
+        except TypeError:
+            ok = svc.verify(body, signature)  # type: ignore[misc]
+        return bool(ok)
+    except Exception as exc:
+        logging.exception("Signature verification unavailable: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Signature service unavailable",
         ) from exc
 
-    validator = BybitSignatureService(BybitSettings())
+
+@router.post("/bybit/webhook")
+async def bybit_webhook(
+    request: Request,
+    # Bybit may use either BYBIT-* (webhooks) or BAPI-* (unified) headers.
+    x_bybit_signature: Optional[str] = Header(None, alias="X-BYBIT-SIGNATURE"),
+    x_bybit_timestamp: Optional[str] = Header(None, alias="X-BYBIT-TIMESTAMP"),
+    x_bapi_sign: Optional[str] = Header(None, alias="X-BAPI-SIGN"),
+    x_bapi_timestamp: Optional[str] = Header(None, alias="X-BAPI-TIMESTAMP"),
+) -> Dict[str, str]:
+    """Handle Bybit webhook: verify signature → parse JSON → publish event."""
+
+    body: bytes = await request.body()
+
+    # Normalize headers (support both naming schemes)
+    signature = x_bybit_signature or x_bapi_sign
+    timestamp = x_bybit_timestamp or x_bapi_timestamp
+    if not signature or not timestamp:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing signature headers",
+        )
+
+    # Verify signature
     try:
-        # Prefer 3-arg call if supported (body, signature, timestamp)
-        verify_sig = validator.verify  # type: ignore[attr-defined]
-        if "timestamp" in inspect.signature(verify_sig).parameters:
-            valid = verify_sig(body, x_bybit_signature, x_bybit_timestamp)  # type: ignore[misc]
-        else:
-            valid = verify_sig(body, x_bybit_signature)  # type: ignore[misc]
-    except TypeError:
-        # Fallback to legacy 2-arg signature
-        valid = validator.verify(body, x_bybit_signature)  # type: ignore[misc]
+        valid = await _verify(body, timestamp, signature)
+    except HTTPException:
+        raise
     except Exception as exc:
         logging.exception("Error during signature verification: %s", exc)
         raise HTTPException(
@@ -88,7 +107,7 @@ async def bybit_webhook(
             detail="Invalid signature",
         )
 
-    # 3) Parse JSON payload
+    # Parse JSON payload
     try:
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError as exc:
@@ -98,11 +117,11 @@ async def bybit_webhook(
             detail="Invalid JSON payload",
         ) from exc
 
-    # 4) Publish event
-    event = BybitWebhookEvent(timestamp=x_bybit_timestamp, payload=payload)
+    # Publish downstream event
+    event = BybitWebhookEvent(timestamp=timestamp, payload=payload)
     try:
         await _publish_event(event)
-    except Exception as exc:  # pragma: no cover - depends on external service
+    except Exception as exc:  # pragma: no cover
         logging.exception("Failed to publish event: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
