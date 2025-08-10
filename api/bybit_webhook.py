@@ -1,6 +1,8 @@
-"""FastAPI route handling Bybit webhook events."""
+
+
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from typing import Any, Dict
@@ -13,39 +15,20 @@ router = APIRouter()
 
 class BybitWebhookEvent(BaseModel):
     """Model representing a Bybit webhook event."""
-
     timestamp: str
     payload: Dict[str, Any]
-
-
-async def _verify_signature(body: bytes, signature: str, timestamp: str) -> bool:
-    """Call external signature verification service.
-
-    The real implementation should be provided elsewhere in the codebase.
-    This fallback always succeeds to keep the example self contained.
-    """
-
-    try:
-        from services.signature import verify_signature  # type: ignore
-    except Exception:  # pragma: no cover - fallback for missing service
-        async def verify_signature(*_: Any, **__: Any) -> bool:  # type: ignore
-            return True
-
-    return await verify_signature(body, signature, timestamp)
 
 
 async def _publish_event(event: BybitWebhookEvent) -> None:
     """Publish event to message broker via existing transport.
 
-    The real transport is expected to be available in the project.  If it is
-    missing, the data is simply logged.
+    If a transport is unavailable, log the event instead.
     """
-
     try:
         from transport import publish  # type: ignore
     except Exception:  # pragma: no cover - fallback for missing transport
         async def publish(e: BybitWebhookEvent) -> None:  # type: ignore
-            logging.info("Event published: %s", e.json())
+            logging.info("Event published (fallback log): %s", e.json())
 
     await publish(event)
 
@@ -58,12 +41,46 @@ async def bybit_webhook(
 ) -> Dict[str, str]:
     """Handle Bybit webhook calls.
 
-    The handler verifies the request signature, serialises the payload into a
-    :class:`BybitWebhookEvent` and publishes it to a message broker.
+    Steps:
+      1) Read raw body.
+      2) Validate signature via BybitSignatureService (uses BybitSettings).
+         - If the service expects a `timestamp` argument, pass it; otherwise call with (body, signature).
+      3) Parse JSON payload.
+      4) Publish event to message broker.
     """
 
-    body = await request.body()
-    valid = await _verify_signature(body, x_bybit_signature, x_bybit_timestamp)
+    # 1) Read raw body
+    body: bytes = await request.body()
+
+    # 2) Validate signature via project service
+    try:
+        from config.bybit import BybitSettings  # type: ignore
+        from services.bybit_signature import BybitSignatureService  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on project wiring
+        logging.exception("Signature service unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Signature service unavailable",
+        ) from exc
+
+    validator = BybitSignatureService(BybitSettings())
+    try:
+        # Prefer 3-arg call if supported (body, signature, timestamp)
+        verify_sig = validator.verify  # type: ignore[attr-defined]
+        if "timestamp" in inspect.signature(verify_sig).parameters:
+            valid = verify_sig(body, x_bybit_signature, x_bybit_timestamp)  # type: ignore[misc]
+        else:
+            valid = verify_sig(body, x_bybit_signature)  # type: ignore[misc]
+    except TypeError:
+        # Fallback to legacy 2-arg signature
+        valid = validator.verify(body, x_bybit_signature)  # type: ignore[misc]
+    except Exception as exc:
+        logging.exception("Error during signature verification: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Signature verification failed",
+        ) from exc
+
     if not valid:
         logging.warning("Bybit webhook received with invalid signature")
         raise HTTPException(
@@ -71,6 +88,7 @@ async def bybit_webhook(
             detail="Invalid signature",
         )
 
+    # 3) Parse JSON payload
     try:
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError as exc:
@@ -80,8 +98,8 @@ async def bybit_webhook(
             detail="Invalid JSON payload",
         ) from exc
 
+    # 4) Publish event
     event = BybitWebhookEvent(timestamp=x_bybit_timestamp, payload=payload)
-
     try:
         await _publish_event(event)
     except Exception as exc:  # pragma: no cover - depends on external service
